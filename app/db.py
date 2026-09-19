@@ -86,6 +86,23 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.commit()
 
 
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """只读事务：WAL 模式下为一致快照读，不取写锁、不阻塞并发写入。
+
+    跨文档引用解析在同一快照内固定根文档与所有 current 引用的修订，
+    并发提交不会改变本次解析所见的内容。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
 def init_db() -> None:
     """启动时调用：确保目录存在并自动建表（幂等）。"""
     parent = os.path.dirname(os.path.abspath(settings.db_path))

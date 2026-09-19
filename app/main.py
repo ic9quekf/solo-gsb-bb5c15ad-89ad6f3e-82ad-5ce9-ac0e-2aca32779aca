@@ -1,8 +1,9 @@
-"""FastAPI 入口：文档创建 / 读取 / 修订历史 / 修订差异 / 带三方合并的更新。"""
+"""FastAPI 入口：文档创建 / 读取 / 修订历史 / 修订差异 / 引用解析 / 带三方合并的更新。"""
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Iterator
@@ -19,6 +20,7 @@ from .merge import (
     present_conflict,
     three_way_merge,
 )
+from .resolve import ResolutionError, resolve_document
 from .schemas import (
     CreateDocument,
     CreateRelease,
@@ -38,10 +40,11 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="共享 JSON 配置三方合并 API",
-    version="1.3.0",
+    version="1.4.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
     "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销；"
-    "支持任意两修订间的递归差异审计。",
+    "支持任意两修订间的递归差异审计；"
+    "支持跨文档 $ref 引用解析（同一读事务快照内固定全部修订）。",
     lifespan=lifespan,
 )
 
@@ -442,6 +445,73 @@ def diff_revisions(
         "to_revision": to_revision,
         "changes": changes,
         "counts": {**counts, "total": len(changes)},
+    }
+
+
+# ---------------------------------------------------------------- 跨文档引用解析
+
+
+def _current_revision_or_none(conn: sqlite3.Connection, doc_id: str) -> int | None:
+    row = db.get_document(conn, doc_id)
+    return row["current_revision"] if row is not None else None
+
+
+def _revision_content_or_none(
+    conn: sqlite3.Connection, doc_id: str, revision: int
+) -> Any:
+    row = db.get_revision(conn, doc_id, revision)
+    return json.loads(row["content"]) if row is not None else None
+
+
+@app.get("/documents/{doc_id}/resolved", tags=["documents"])
+def get_resolved_document(
+    doc_id: str,
+    revision: str = Query(
+        "current", description="根文档修订：正整数修订号或 current（默认）"
+    ),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """跨文档引用解析：递归展开 ``$ref`` 引用，返回拼装后的完整文档（只读）。
+
+    * 仅含 ``$ref`` 键且值形如 ``doc:<ID>@<正整数|current>#<RFC6901指针>``
+      的对象视为引用，在对象与数组中递归替换；其余 ``$ref`` 对象原样保留；
+    * 全程在**同一 SQLite 读事务快照**内：根文档与所有 ``current`` 引用的
+      修订在快照内固定，并发写入不影响本次解析结果；
+    * 返回 ``resolved``（解析结果）、``revision``（根修订）与
+      ``dependencies``（按首次遍历排序、按 文档+修订+指针 去重的依赖清单）；
+    * 文档 / 修订 / 指针不存在 → ``422`` 及完整引用链；
+      依赖成环 → ``409`` 及首尾闭合链；最大解析深度 32。
+    """
+    if revision == "current":
+        revision_spec: int | str = "current"
+    elif re.fullmatch(r"[1-9][0-9]*", revision):
+        revision_spec = int(revision)
+    else:
+        raise err(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "invalid_revision",
+            document_id=doc_id,
+            revision=revision,
+            reason="revision 必须是正整数修订号或 current",
+        )
+
+    # 只读事务（WAL 快照）：本次解析见到的所有修订相互一致
+    with db.read_transaction(conn):
+        try:
+            resolved, root_revision, dependencies = resolve_document(
+                doc_id,
+                revision_spec,
+                lambda target: _current_revision_or_none(conn, target),
+                lambda target, rev: _revision_content_or_none(conn, target, rev),
+            )
+        except ResolutionError as exc:
+            raise err(exc.status_code, exc.code, chain=exc.chain, **exc.extra)
+
+    return {
+        "id": doc_id,
+        "revision": root_revision,
+        "resolved": resolved,
+        "dependencies": dependencies,
     }
 
 

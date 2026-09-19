@@ -50,6 +50,17 @@
 每项同时给出 `before` / `after`，并用 `missing` 区分键缺失与真实 `null`，数组作为整体值比较；
 任一修订不存在返回 `404` 并指出缺失修订，响应附各操作计数，空差异返回空数组。
 
+配置被拆分到多个文档、需要拼装成一份完整视图时，可用
+**`GET /documents/{id}/resolved?revision=` 跨文档引用解析**：
+文档中**仅含 `$ref` 键**且值形如 `doc:<ID>@<正整数|current>#<RFC6901指针>` 的对象
+会被视为引用，服务端在**同一个 SQLite 读事务快照**内固定根文档与所有 `current`
+引用的修订，递归替换对象与数组中的引用（只读，不产生修订）：
+
+- 返回 `resolved`（解析结果）、`revision`（根修订）与 `dependencies`
+  （按首次遍历排序、按 文档+修订+指针 去重的依赖清单）；
+- 文档 / 修订 / 指针不存在 → `422` 及从根文档出发的完整引用链；
+- 依赖成环 → `409` 及首尾闭合的环链；最大解析深度为 32。
+
 ## 一键启动
 
 需要 Docker 与 Docker Compose v2：
@@ -103,6 +114,7 @@ docker compose down -v       # 停止并删除数据卷
 | `GET` | `/documents/{id}/revisions` | 修订历史（支持 `limit`/`offset`/`order=asc|desc`） |
 | `GET` | `/documents/{id}/revisions/{rev}` | 查询指定修订的内容与 patch |
 | `GET` | `/documents/{id}/diff` | 比较两个修订快照（`from_revision`/`to_revision`），返回按 RFC 6901 路径排序的 add/remove/replace 差异 |
+| `GET` | `/documents/{id}/resolved` | 跨文档引用解析（`revision` 可选，默认 `current`），返回 `resolved` 与去重依赖清单 |
 | `PUT` | `/documents/{id}/schema` | 设置 / 替换 JSON Schema 2020-12 契约 |
 | `GET` | `/documents/{id}/schema` | 查询当前契约（未设置返回 `404 schema_not_found`） |
 | `DELETE` | `/documents/{id}/schema` | 删除契约（幂等，删除后恢复原更新行为） |
@@ -438,6 +450,102 @@ curl 'http://localhost:8000/documents/demo/diff?from_revision=1&to_revision=3'
     "from_revision": 1, "to_revision": 99, "missing_revisions": [99]}}
   ```
 
+## 跨文档引用解析（GET /documents/{id}/resolved）
+
+只读接口：把分散在多个文档中的配置按 `$ref` 引用拼装成一份完整视图。
+对象**恰好只含一个 `$ref` 键**、且值整体匹配
+`doc:<ID>@<正整数|current>#<RFC6901指针>` 时视为引用，在对象与数组中递归替换；
+其余形态的 `$ref`（含额外键、值不匹配格式）只是普通数据，原样保留。
+
+- `@current` —— 解析时固定为目标文档的当前修订；`@<正整数>` —— 固定为指定历史修订；
+- `#` 之后为 RFC 6901 JSON Pointer（单独的 `#` 指整篇文档），数组下标为
+  `0` 或不带前导零的正整数；指针按字面解释，不做百分号解码；
+- 被引用的目标值本身也会继续解析（目标文档里的嵌套引用在目标上下文中展开）；
+- 同一 (文档, 修订, 指针) 目标在**当前解析路径**上再次出现 → 依赖成环；
+  不同分支重复引用同一目标是合法的（菱形），直接复用首次解析结果。
+
+```bash
+# base: {"host": "db.internal", "port": 5432}
+# app:  {"database": {"$ref": "doc:base@current#"}, "debug": false}
+curl 'http://localhost:8000/documents/app/resolved'
+```
+
+```json
+{
+  "id": "app",
+  "revision": 1,
+  "resolved": {"database": {"host": "db.internal", "port": 5432}, "debug": false},
+  "dependencies": [
+    {"document_id": "base", "revision": 1, "pointer": ""}
+  ]
+}
+```
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `revision` | 实际使用的根文档修订（`?revision=` 可指定历史修订，默认 `current`） |
+| `resolved` | 全部引用递归展开后的文档内容 |
+| `dependencies` | 依赖清单，按**首次遍历**排序、按 (文档, 修订, 指针) 去重；`current` 引用以快照内固定的具体修订号给出 |
+
+一致性保证：根文档与所有 `current` 引用的修订在**同一个 SQLite 读事务快照**
+（WAL 快照读，不阻塞并发写入）内固定，一次解析看到的内容彼此一致；
+解析不写入任何数据。最大解析深度为 **32**（沿解析路径的引用跳数上限）。
+
+### 解析失败：422 与完整引用链
+
+被引用的文档 / 修订 / 指针不存在时返回 `422`，`chain` 给出从根文档出发的
+**完整引用链**（每项含 `document_id` / `revision` / `pointer` /
+`ref`（原始引用串）/ `at`（引用在上一跳文档中的位置））：
+
+```bash
+# app 的内容：{"database": {"$ref": "doc:ghost@current#/host"}}
+curl -i 'http://localhost:8000/documents/app/resolved'
+```
+
+```json
+HTTP/1.1 422 Unprocessable Entity
+{
+  "detail": {
+    "error": "document_not_found",
+    "document_id": "ghost",
+    "reason": "被引用文档不存在",
+    "chain": [
+      {"document_id": "app",   "revision": 1, "pointer": "",      "ref": null, "at": null},
+      {"document_id": "ghost", "revision": null, "pointer": "/host",
+       "ref": "doc:ghost@current#/host", "at": "/database"}
+    ]
+  }
+}
+```
+
+同类错误还有 `revision_not_found`（指定修订不存在）、`pointer_not_found`
+（指针在目标修订中不存在或转义非法）、`max_depth_exceeded`（超过深度 32），
+均携带完整引用链；`?revision=` 不是正整数或 `current` 时返回 `422 invalid_revision`。
+
+### 依赖成环：409 与首尾闭合链
+
+```json
+HTTP/1.1 409 Conflict
+{
+  "detail": {
+    "error": "reference_cycle",
+    "document_id": "b",
+    "revision": 1,
+    "pointer": "/x",
+    "reason": "依赖成环",
+    "chain": [
+      {"document_id": "b", "revision": 1, "pointer": "/x", "ref": "doc:b@1#/x", "at": "/start"},
+      {"document_id": "c", "revision": 1, "pointer": "/y", "ref": "doc:c@1#/y", "at": "/b"},
+      {"document_id": "b", "revision": 1, "pointer": "/x", "ref": "doc:b@1#/x", "at": "/c"}
+    ]
+  }
+}
+```
+
+`chain` 只含环本身：链首与链尾是同一个 (文档, 修订, 指针)，首尾闭合。
+
 ## JSON Schema 契约（可选）
 
 每个文档最多一个契约，遵循 [JSON Schema 2020-12](https://json-schema.org/draft/2020-12)
@@ -569,22 +677,29 @@ HTTP/1.1 422 Unprocessable Entity
 | `409 request_id_conflict` | 同一 request_id 对应了不同内容（PATCH 与撤销共用幂等表） |
 | `409 release_id_conflict` | 同一 release_id 对应了不同的整批请求 |
 | `409 document_exists` | 创建时 ID 已存在 |
+| `409 reference_cycle` | 引用解析依赖成环（响应含首尾闭合的环链） |
 | `422 release_failed` | 原子发布存在失败项（`failures` 按输入顺序汇总，整批回滚、不占用 release_id） |
 | `422 unknown_base_revision` | base_revision 不是该文档的现存修订 |
 | `422 invalid_revert_revision` | 待撤销 revision 不存在或不大于 1（修订 1 为创建快照） |
 | `422 invalid_schema` | 设置契约时 Schema 本身不符合 JSON Schema 2020-12 |
 | `422 schema_validation_failed` | 当前文档（设置时）或合并后的最终候选（PATCH 时）不满足契约 |
+| `422 invalid_revision` | 引用解析的 `revision` 参数不是正整数修订号或 `current` |
+| `422 document_not_found` | 引用解析中（根或被引用的）文档不存在（含完整引用链） |
+| `422 revision_not_found` | 引用解析中指定修订不存在（含完整引用链） |
+| `422 pointer_not_found` | 引用解析中指针在目标修订中不存在或转义非法（含完整引用链） |
+| `422 max_depth_exceeded` | 引用解析深度超过 32（含完整引用链） |
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、冲突响应、契约接口、差异审计）
+│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、冲突响应、契约接口、差异审计、引用解析）
 │   ├── merge.py       # RFC 7386 打补丁 + 递归三方合并（无框架依赖，可单测）
 │   ├── diff.py        # 两快照递归差异审计（add/remove/replace，无框架依赖，可单测）
+│   ├── resolve.py     # 跨文档 $ref 引用递归解析（环检测、深度上限，无框架依赖，可单测）
 │   ├── validation.py  # JSON Schema 2020-12 元校验与实例校验（错误稳定排序）
-│   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约表读写
+│   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约表读写、读写事务
 │   ├── schemas.py     # Pydantic 请求模型（额外字段拒绝）
 │   └── config.py      # 环境变量配置
 ├── tests/
@@ -593,7 +708,8 @@ HTTP/1.1 422 Unprocessable Entity
 │   ├── test_contracts.py # 契约接口与 PATCH 校验集成测试（19 例）
 │   ├── test_reverts.py   # POST /documents/{id}/reverts 撤销集成测试（25 例）
 │   ├── test_releases.py  # POST /releases 原子发布集成测试（17 例）
-│   └── test_diff.py      # GET /documents/{id}/diff 差异审计集成测试（17 例）
+│   ├── test_diff.py      # GET /documents/{id}/diff 差异审计集成测试（17 例）
+│   └── test_resolve.py   # GET /documents/{id}/resolved 引用解析集成测试（33 例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
